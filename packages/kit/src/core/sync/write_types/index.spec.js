@@ -401,4 +401,17 @@ describe('write_all_types caching', () => {
 			expect(fs.existsSync(root_types)).toBe(true);
 		});
 	});
+
+	test('recovers when route_meta_data.json contains invalid JSON', () => {
+		with_temp_project(({ root, config, types_dir }) => {
+			const manifest = create_manifest_data(config, root);
+			write_all_types(config, manifest, root);
+
+			const meta_data_file = path.join(types_dir, 'route_meta_data.json');
+			fs.writeFileSync(meta_data_file, '{"/": [');
+
+			expect(() => write_all_types(config, manifest, root)).not.toThrow();
+			expect(() => JSON.parse(fs.readFileSync(meta_data_file, 'utf-8'))).not.toThrow();
+		});
+	});
 });

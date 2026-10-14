@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import MagicString from 'magic-string';
@@ -60,10 +61,13 @@ export function write_all_types(config, manifest_data, root) {
 	// Read/write meta data on each invocation, not once per node process,
 	// it could be invoked by another process in the meantime.
 	const meta_data_file = `${types_dir}/route_meta_data.json`;
-	const has_meta_data = fs.existsSync(meta_data_file);
-	const meta_data = has_meta_data
-		? /** @type {Record<string, string[]>} */ (JSON.parse(fs.readFileSync(meta_data_file, 'utf-8')))
-		: {};
+	/** @type {Record<string, string[]>} */
+	let meta_data = {};
+	try {
+		meta_data = JSON.parse(fs.readFileSync(meta_data_file, 'utf-8'));
+	} catch {
+		// file does not exist or could not be parsed
+	}
 	const routes_map = create_routes_map(manifest_data);
 	// For each directory, write $types.d.ts
 	for (const route of manifest_data.routes) {
@@ -95,18 +99,22 @@ export function write_all_types(config, manifest_data, root) {
 			input_files.push(route.endpoint.file);
 		}
 
-		const output_files = fs.existsSync(outdir)
-			? compact(
-					fs.readdirSync(outdir).map((name) => {
-						const stats = fs.statSync(path.join(outdir, name));
-						if (stats.isDirectory()) return;
-						return {
-							name,
-							updated: stats.mtimeMs
-						};
-					})
-				)
-			: [];
+		/** @type {Array<{ name: string; updated: number }>} */
+		let output_files = [];
+		try {
+			output_files = compact(
+				fs.readdirSync(outdir).map((name) => {
+					const stats = fs.statSync(path.join(outdir, name));
+					if (stats.isDirectory()) return;
+					return {
+						name,
+						updated: stats.mtimeMs
+					};
+				})
+			);
+		} catch {
+			// directory does not exist or could not be read
+		}
 
 		const source_last_updated = Math.max(
 			// ctimeMs includes move operations whereas mtimeMs does not
@@ -119,9 +127,7 @@ export function write_all_types(config, manifest_data, root) {
 			source_last_updated > types_last_updated ||
 			// $types.d.ts is missing (e.g. for a route with only +page.svelte where input_files is empty)
 			!output_files.some((file) => file.name === '$types.d.ts') ||
-			// no meta data file exists yet
-			!has_meta_data ||
-			// some file was deleted
+			// no meta data for this route yet, or some file was deleted
 			!meta_data[route.id]?.every((file) => input_files.includes(file));
 
 		if (should_generate) {
@@ -133,7 +139,13 @@ export function write_all_types(config, manifest_data, root) {
 	}
 
 	fs.mkdirSync(types_dir, { recursive: true });
-	fs.writeFileSync(meta_data_file, JSON.stringify(meta_data, null, '\t'));
+	const meta_data_temp_file = path.join(config.outDir, `route_meta_data.${randomUUID()}.tmp`);
+	try {
+		fs.writeFileSync(meta_data_temp_file, JSON.stringify(meta_data, null, '\t'));
+		fs.renameSync(meta_data_temp_file, meta_data_file);
+	} finally {
+		fs.rmSync(meta_data_temp_file, { force: true });
+	}
 }
 
 /**

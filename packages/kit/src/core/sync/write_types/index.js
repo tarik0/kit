@@ -63,11 +63,23 @@ export function write_all_types(config, manifest_data, root) {
 	const meta_data_file = `${types_dir}/route_meta_data.json`;
 	/** @type {Record<string, string[]>} */
 	let meta_data = {};
+	let has_meta_data = false;
+	let meta_data_updated = 0;
 	try {
 		meta_data = JSON.parse(fs.readFileSync(meta_data_file, 'utf-8'));
+		meta_data_updated = fs.statSync(meta_data_file).mtimeMs;
+		has_meta_data = true;
 	} catch {
 		// file does not exist or could not be parsed
 	}
+
+	/** @type {Record<string, string[]>} */
+	const next_meta_data = {};
+	let meta_data_changed = !has_meta_data;
+
+	/** @type {Map<string, number>} */
+	const source_ctimes = new Map();
+
 	const routes_map = create_routes_map(manifest_data);
 	// For each directory, write $types.d.ts
 	for (const route of manifest_data.routes) {
@@ -78,25 +90,46 @@ export function write_all_types(config, manifest_data, root) {
 		// check if the types are out of date
 		/** @type {string[]} */
 		const input_files = [];
-
-		/** @type {import('types').PageNode | null} */
-		let node = route.leaf;
-		while (node) {
-			if (node.universal) input_files.push(node.universal);
-			if (node.server) input_files.push(node.server);
-			node = node.parent ?? null;
-		}
-
-		/** @type {import('types').PageNode | null} */
-		node = route.layout;
-		while (node) {
-			if (node.universal) input_files.push(node.universal);
-			if (node.server) input_files.push(node.server);
-			node = node.parent ?? null;
-		}
+		/** @type {string[]} */
+		const tracked_files = [];
 
 		if (route.endpoint) {
 			input_files.push(route.endpoint.file);
+			tracked_files.push(route.endpoint.file);
+		}
+
+		for (const node of [route.layout, route.leaf]) {
+			let current = node;
+			while (current) {
+				if (current.component) tracked_files.push(current.component);
+				if (current.universal) {
+					input_files.push(current.universal);
+					tracked_files.push(current.universal);
+				}
+				if (current.server) {
+					input_files.push(current.server);
+					tracked_files.push(current.server);
+				}
+				current = current.parent ?? null;
+			}
+		}
+
+		if (route.layout?.child_pages) {
+			const children_affect_load_shape =
+				Boolean(route.layout.server || route.layout.universal) &&
+				route.layout.child_pages.every((page) => page.server || page.universal);
+
+			for (const page of route.layout.child_pages) {
+				if (page.component) tracked_files.push(page.component);
+				if (page.universal) {
+					tracked_files.push(page.universal);
+					if (children_affect_load_shape) input_files.push(page.universal);
+				}
+				if (page.server) {
+					tracked_files.push(page.server);
+					if (children_affect_load_shape) input_files.push(page.server);
+				}
+			}
 		}
 
 		/** @type {Array<{ name: string; updated: number }>} */
@@ -118,33 +151,48 @@ export function write_all_types(config, manifest_data, root) {
 
 		const source_last_updated = Math.max(
 			// ctimeMs includes move operations whereas mtimeMs does not
-			...input_files.map((file) => fs.statSync(path.resolve(root, file)).ctimeMs)
+			...input_files.map((file) => {
+				let ctime = source_ctimes.get(file);
+				if (ctime === undefined) {
+					ctime = fs.statSync(path.resolve(root, file)).ctimeMs;
+					source_ctimes.set(file, ctime);
+				}
+				return ctime;
+			})
 		);
-		const types_last_updated = Math.max(...output_files.map((file) => file.updated));
+		const types_last_updated = Math.max(
+			...output_files.map((file) => file.updated),
+			meta_data_updated
+		);
 
 		const should_generate =
-			// source files were generated more recently than the types
-			source_last_updated > types_last_updated ||
+			// look for explicit changes in a layout/page trajectory
+			meta_data[route.id]?.length !== tracked_files.length ||
+			!meta_data[route.id]?.every((file, i) => file === tracked_files[i]) ||
 			// $types.d.ts is missing (e.g. for a route with only +page.svelte where input_files is empty)
 			!output_files.some((file) => file.name === '$types.d.ts') ||
-			// no meta data for this route yet, or some file was deleted
-			!meta_data[route.id]?.every((file) => input_files.includes(file));
+			// source files were generated more recently than the types
+			source_last_updated > types_last_updated;
 
 		if (should_generate) {
 			// track which old files end up being surplus to requirements
 			const to_delete = new Set(output_files.map((file) => file.name));
 			update_types(config, routes_map, route, root, to_delete);
-			meta_data[route.id] = input_files;
+			meta_data_changed = true;
 		}
+
+		next_meta_data[route.id] = tracked_files;
 	}
 
-	fs.mkdirSync(types_dir, { recursive: true });
-	const meta_data_temp_file = path.join(config.outDir, `route_meta_data.${randomUUID()}.tmp`);
-	try {
-		fs.writeFileSync(meta_data_temp_file, JSON.stringify(meta_data, null, '\t'));
-		fs.renameSync(meta_data_temp_file, meta_data_file);
-	} finally {
-		fs.rmSync(meta_data_temp_file, { force: true });
+	if (meta_data_changed || Object.keys(meta_data).length !== Object.keys(next_meta_data).length) {
+		fs.mkdirSync(types_dir, { recursive: true });
+		const meta_data_temp_file = path.join(config.outDir, `route_meta_data.${randomUUID()}.tmp`);
+		try {
+			fs.writeFileSync(meta_data_temp_file, JSON.stringify(next_meta_data, null, '\t'));
+			fs.renameSync(meta_data_temp_file, meta_data_file);
+		} finally {
+			fs.rmSync(meta_data_temp_file, { force: true });
+		}
 	}
 }
 

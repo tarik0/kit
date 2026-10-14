@@ -414,4 +414,107 @@ describe('write_all_types caching', () => {
 			expect(() => JSON.parse(fs.readFileSync(meta_data_file, 'utf-8'))).not.toThrow();
 		});
 	});
+
+	test('regenerates layout $types.d.ts when child pages are added or removed', () => {
+		with_temp_project(({ root, config, types_dir }) => {
+			fs.writeFileSync(path.join(root, 'src/routes/+layout.svelte'), '');
+
+			const manifest = create_manifest_data(config, root);
+			write_all_types(config, manifest, root);
+
+			const root_types = path.join(types_dir, 'src/routes/$types.d.ts');
+			expect(fs.readFileSync(root_types, 'utf-8')).not.toContain('"/[slug]"');
+
+			// Add a new child page with only +page.svelte (and set future mtime on existing types
+			// to ensure regeneration relies on tracked_files rather than ctimeMs alone)
+			const future = new Date(Date.now() + 60_000);
+			fs.utimesSync(root_types, future, future);
+			fs.utimesSync(path.join(types_dir, 'route_meta_data.json'), future, future);
+
+			fs.mkdirSync(path.join(root, 'src/routes/[slug]'), { recursive: true });
+			fs.writeFileSync(path.join(root, 'src/routes/[slug]/+page.svelte'), '');
+
+			const manifest_with_slug = create_manifest_data(config, root);
+			write_all_types(config, manifest_with_slug, root);
+
+			const updated_content = fs.readFileSync(root_types, 'utf-8');
+			expect(updated_content).toContain('"/[slug]"');
+			expect(updated_content).toContain('slug?: string');
+
+			// Remove the child page and verify layout types update again
+			fs.utimesSync(root_types, future, future);
+			fs.utimesSync(path.join(types_dir, 'route_meta_data.json'), future, future);
+			fs.rmSync(path.join(root, 'src/routes/[slug]'), { force: true, recursive: true });
+
+			const manifest_without_slug = create_manifest_data(config, root);
+			write_all_types(config, manifest_without_slug, root);
+
+			const final_content = fs.readFileSync(root_types, 'utf-8');
+			expect(final_content).not.toContain('"/[slug]"');
+			expect(final_content).not.toContain('slug?: string');
+		});
+	});
+
+	test('regenerates layout $types.d.ts when a child page load export changes', () => {
+		with_temp_project(({ root, config, types_dir }) => {
+			// Remove only-svelte so all child pages initially have load functions
+			fs.rmSync(path.join(root, 'src/routes/only-svelte'), { force: true, recursive: true });
+			fs.writeFileSync(
+				path.join(root, 'src/routes/+layout.server.js'),
+				'export function load() { return { layout: 1 }; }\n'
+			);
+			fs.writeFileSync(path.join(root, 'src/routes/+layout.svelte'), '');
+
+			const manifest = create_manifest_data(config, root);
+			write_all_types(config, manifest, root);
+
+			const root_types = path.join(types_dir, 'src/routes/$types.d.ts');
+			const meta_data_file = path.join(types_dir, 'route_meta_data.json');
+			expect(fs.readFileSync(root_types, 'utf-8')).toContain(
+				'export type LayoutServerLoad<OutputData extends Partial<App.PageData> & Record<string, any> | void'
+			);
+
+			// Backdate generated files so editing child +page.js has ctimeMs > types_last_updated
+			const past = new Date(Date.now() - 10_000);
+			fs.utimesSync(root_types, past, past);
+			fs.utimesSync(meta_data_file, past, past);
+
+			// Edit child +page.js to remove its load export without adding/removing the file
+			fs.writeFileSync(path.join(root, 'src/routes/sub/+page.js'), 'export const ssr = true;\n');
+
+			const next_manifest = create_manifest_data(config, root);
+			write_all_types(config, next_manifest, root);
+
+			expect(fs.readFileSync(root_types, 'utf-8')).toContain(
+				'export type LayoutServerLoad<OutputData extends OutputDataShape<LayoutServerParentData> = OutputDataShape<LayoutServerParentData>>'
+			);
+		});
+	});
+
+	test('prunes removed routes from route_meta_data.json and avoids rewriting when unchanged', () => {
+		with_temp_project(({ root, config, types_dir }) => {
+			const manifest = create_manifest_data(config, root);
+			write_all_types(config, manifest, root);
+
+			const meta_data_file = path.join(types_dir, 'route_meta_data.json');
+			const initial_meta = JSON.parse(fs.readFileSync(meta_data_file, 'utf-8'));
+			expect(initial_meta).toHaveProperty('/sub');
+
+			// Set a sentinel mtime on route_meta_data.json and re-run without changes
+			const sentinel_time = new Date(Date.now() + 30_000);
+			fs.utimesSync(meta_data_file, sentinel_time, sentinel_time);
+			const mtime_before = fs.statSync(meta_data_file).mtimeMs;
+
+			write_all_types(config, manifest, root);
+			expect(fs.statSync(meta_data_file).mtimeMs).toBe(mtime_before);
+
+			// Remove /sub route and verify it is pruned from route_meta_data.json
+			fs.rmSync(path.join(root, 'src/routes/sub'), { force: true, recursive: true });
+			const next_manifest = create_manifest_data(config, root);
+			write_all_types(config, next_manifest, root);
+
+			const updated_meta = JSON.parse(fs.readFileSync(meta_data_file, 'utf-8'));
+			expect(updated_meta).not.toHaveProperty('/sub');
+		});
+	});
 });
